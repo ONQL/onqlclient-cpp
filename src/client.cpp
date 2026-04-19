@@ -61,40 +61,6 @@ static std::string simple_json_escape(const std::string& s) {
     return out;
 }
 
-struct PathParts {
-    std::string db;
-    std::string table;
-    std::string id;
-};
-
-static PathParts parsePath(const std::string& path, bool requireId) {
-    if (path.empty()) {
-        throw std::invalid_argument(
-            "Path must be a non-empty string like \"db.table\" or \"db.table.id\"");
-    }
-    auto dot1 = path.find('.');
-    if (dot1 == std::string::npos || dot1 == 0 || dot1 == path.size() - 1) {
-        throw std::invalid_argument("Path \"" + path + "\" must contain at least \"db.table\"");
-    }
-    auto dot2 = path.find('.', dot1 + 1);
-    PathParts p;
-    p.db = path.substr(0, dot1);
-    if (dot2 == std::string::npos) {
-        p.table = path.substr(dot1 + 1);
-    } else {
-        p.table = path.substr(dot1 + 1, dot2 - dot1 - 1);
-        p.id    = path.substr(dot2 + 1);
-    }
-    if (p.table.empty()) {
-        throw std::invalid_argument("Path \"" + path + "\" must contain at least \"db.table\"");
-    }
-    if (requireId && p.id.empty()) {
-        throw std::invalid_argument(
-            "Path \"" + path + "\" must include a record id: \"db.table.id\"");
-    }
-    return p;
-}
-
 /* ------------------------------------------------------------------ */
 /* Client – construction / destruction / move                          */
 /* ------------------------------------------------------------------ */
@@ -418,15 +384,15 @@ std::string Client::processResult(const std::string& raw) {
     return find_value(raw, "data");
 }
 
-std::string Client::insert(const std::string& path,
+std::string Client::insert(const std::string& db,
+                           const std::string& table,
                            const std::string& recordJson) {
-    PathParts p = parsePath(path, false);
     std::string payload;
-    payload.reserve(64 + path.size() + recordJson.size());
+    payload.reserve(64 + db.size() + table.size() + recordJson.size());
     payload  = "{\"db\":\"";
-    payload += simple_json_escape(p.db);
+    payload += simple_json_escape(db);
     payload += "\",\"table\":\"";
-    payload += simple_json_escape(p.table);
+    payload += simple_json_escape(table);
     payload += "\",\"records\":";
     payload += recordJson.empty() ? std::string("null") : recordJson;
     payload += "}";
@@ -435,42 +401,50 @@ std::string Client::insert(const std::string& path,
     return processResult(r.payload);
 }
 
-std::string Client::update(const std::string& path,
+std::string Client::update(const std::string& db,
+                           const std::string& table,
                            const std::string& recordJson,
-                           const std::string& protopass) {
-    PathParts p = parsePath(path, true);
+                           const std::string& query,
+                           const std::string& protopass,
+                           const std::string& idsJson) {
     std::string payload;
-    payload.reserve(128 + path.size() + recordJson.size());
+    payload.reserve(128 + db.size() + table.size() + recordJson.size() + query.size() + idsJson.size());
     payload  = "{\"db\":\"";
-    payload += simple_json_escape(p.db);
+    payload += simple_json_escape(db);
     payload += "\",\"table\":\"";
-    payload += simple_json_escape(p.table);
+    payload += simple_json_escape(table);
     payload += "\",\"records\":";
     payload += recordJson.empty() ? std::string("null") : recordJson;
-    payload += ",\"query\":\"\",\"protopass\":\"";
+    payload += ",\"query\":\"";
+    payload += simple_json_escape(query);
+    payload += "\",\"protopass\":\"";
     payload += simple_json_escape(protopass);
-    payload += "\",\"ids\":[\"";
-    payload += simple_json_escape(p.id);
-    payload += "\"]}";
+    payload += "\",\"ids\":";
+    payload += idsJson.empty() ? std::string("[]") : idsJson;
+    payload += "}";
 
     Response r = sendRequest("update", payload);
     return processResult(r.payload);
 }
 
-std::string Client::remove(const std::string& path,
-                           const std::string& protopass) {
-    PathParts p = parsePath(path, true);
+std::string Client::remove(const std::string& db,
+                           const std::string& table,
+                           const std::string& query,
+                           const std::string& protopass,
+                           const std::string& idsJson) {
     std::string payload;
-    payload.reserve(128 + path.size());
+    payload.reserve(128 + db.size() + table.size() + query.size() + idsJson.size());
     payload  = "{\"db\":\"";
-    payload += simple_json_escape(p.db);
+    payload += simple_json_escape(db);
     payload += "\",\"table\":\"";
-    payload += simple_json_escape(p.table);
-    payload += "\",\"query\":\"\",\"protopass\":\"";
+    payload += simple_json_escape(table);
+    payload += "\",\"query\":\"";
+    payload += simple_json_escape(query);
+    payload += "\",\"protopass\":\"";
     payload += simple_json_escape(protopass);
-    payload += "\",\"ids\":[\"";
-    payload += simple_json_escape(p.id);
-    payload += "\"]}";
+    payload += "\",\"ids\":";
+    payload += idsJson.empty() ? std::string("[]") : idsJson;
+    payload += "}";
 
     Response r = sendRequest("delete", payload);
     return processResult(r.payload);

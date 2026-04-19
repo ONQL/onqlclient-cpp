@@ -63,31 +63,43 @@ public:
     //  Direct ORM-style API (insert / update / remove / onql / build /
     //  processResult)
     //
-    //  `path` is a dotted string:
-    //    "mydb.users"        -> table `users` in database `mydb`
-    //    "mydb.users.u1"     -> record with id `u1`
+    //  `query` arguments are ONQL expression strings, e.g.
+    //    "mydb.users[id=\"u1\"].id"
+    //    "mydb.orders[status=\"pending\"]"
     //
     //  Because the driver is dependency-free, every JSON-valued
-    //  parameter (record, ctxvalues) is passed as a pre-serialized
+    //  parameter (record, ids, ctxvalues) is passed as a pre-serialized
     //  JSON string; use your favourite C++ JSON library
     //  (nlohmann/json, RapidJSON, ...) to serialise.
     // ------------------------------------------------------------------
 
-    /** Insert a single record at `path` (e.g. "mydb.users"). */
-    std::string insert(const std::string& path,
+    /** Insert a single record into `db.table`. */
+    std::string insert(const std::string& db,
+                       const std::string& table,
                        const std::string& recordJson);
 
-    /** Update the record at `path` (e.g. "mydb.users.u1"). */
-    std::string update(const std::string& path,
+    /**
+     * Update records in `db.table` matching `query` (or the explicit
+     * `idsJson`). `query` is an ONQL expression; pass "" when using
+     * `idsJson`. `idsJson` is a JSON array of record IDs, e.g.
+     * `"[]"` or `"[\"u1\"]"`.
+     */
+    std::string update(const std::string& db,
+                       const std::string& table,
                        const std::string& recordJson,
-                       const std::string& protopass = "default");
+                       const std::string& query,
+                       const std::string& protopass = "default",
+                       const std::string& idsJson   = "[]");
 
     /**
-     * Delete the record at `path`. Named `remove` to avoid the C++
+     * Delete records in `db.table`. Named `remove` to avoid the C++
      * keyword `delete`.
      */
-    std::string remove(const std::string& path,
-                       const std::string& protopass = "default");
+    std::string remove(const std::string& db,
+                       const std::string& table,
+                       const std::string& query,
+                       const std::string& protopass = "default",
+                       const std::string& idsJson   = "[]");
 
     /** Execute a raw ONQL query. */
     std::string onql(const std::string& query,

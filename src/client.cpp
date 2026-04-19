@@ -1,16 +1,11 @@
 /*
  * ONQL C++ Driver - Implementation
- *
- * Thread-safe async TCP client with background reader thread.
  */
 
 #include "onql/client.hpp"
 
 #include <cstring>
-#include <cstdlib>
-#include <ctime>
 #include <random>
-#include <sstream>
 #include <algorithm>
 
 /* ------------------------------------------------------------------ */
@@ -40,10 +35,6 @@
   #define SOCK_CLOSE(s) ::close(s)
 #endif
 
-/* ------------------------------------------------------------------ */
-/* Protocol constants                                                  */
-/* ------------------------------------------------------------------ */
-
 static constexpr char EOM   = '\x04';
 static constexpr char DELIM = '\x1E';
 static constexpr int  RID_LEN = 8;
@@ -70,6 +61,40 @@ static std::string simple_json_escape(const std::string& s) {
     return out;
 }
 
+struct PathParts {
+    std::string db;
+    std::string table;
+    std::string id;
+};
+
+static PathParts parsePath(const std::string& path, bool requireId) {
+    if (path.empty()) {
+        throw std::invalid_argument(
+            "Path must be a non-empty string like \"db.table\" or \"db.table.id\"");
+    }
+    auto dot1 = path.find('.');
+    if (dot1 == std::string::npos || dot1 == 0 || dot1 == path.size() - 1) {
+        throw std::invalid_argument("Path \"" + path + "\" must contain at least \"db.table\"");
+    }
+    auto dot2 = path.find('.', dot1 + 1);
+    PathParts p;
+    p.db = path.substr(0, dot1);
+    if (dot2 == std::string::npos) {
+        p.table = path.substr(dot1 + 1);
+    } else {
+        p.table = path.substr(dot1 + 1, dot2 - dot1 - 1);
+        p.id    = path.substr(dot2 + 1);
+    }
+    if (p.table.empty()) {
+        throw std::invalid_argument("Path \"" + path + "\" must contain at least \"db.table\"");
+    }
+    if (requireId && p.id.empty()) {
+        throw std::invalid_argument(
+            "Path \"" + path + "\" must include a record id: \"db.table.id\"");
+    }
+    return p;
+}
+
 /* ------------------------------------------------------------------ */
 /* Client – construction / destruction / move                          */
 /* ------------------------------------------------------------------ */
@@ -80,9 +105,7 @@ Client::Client()
     , running_(false)
 {}
 
-Client::~Client() {
-    close();
-}
+Client::~Client() { close(); }
 
 Client::Client(Client&& o) noexcept
     : sock_(o.sock_)
@@ -90,7 +113,6 @@ Client::Client(Client&& o) noexcept
     , running_(o.running_.load())
     , recvBuf_(std::move(o.recvBuf_))
     , pending_(std::move(o.pending_))
-    , subs_(std::move(o.subs_))
 {
     o.sock_ = SOCK_INVALID;
     o.running_ = false;
@@ -107,7 +129,6 @@ Client& Client::operator=(Client&& o) noexcept {
         running_        = o.running_.load();
         recvBuf_        = std::move(o.recvBuf_);
         pending_        = std::move(o.pending_);
-        subs_           = std::move(o.subs_);
         o.sock_    = SOCK_INVALID;
         o.running_ = false;
         if (o.readerThread_.joinable())
@@ -152,14 +173,6 @@ Client Client::connect(const std::string& host, int port,
     c.running_        = true;
     c.readerThread_   = std::thread(&Client::readerLoop, &c);
 
-    /* Give the reader thread a moment to start — the thread captures `this`
-       via the moved-from object, but the caller receives the object after
-       move construction.  We solve this by NOT starting the thread here;
-       instead we start it after the move.  However, std::thread cannot be
-       "deferred".  The cleanest approach is to return by pointer or use
-       a shared state.  For simplicity we launch the thread inside connect
-       and rely on the move constructor to transfer it. */
-
     return c;
 }
 
@@ -195,7 +208,7 @@ void Client::sendRaw(const std::string& data) {
 }
 
 /* ------------------------------------------------------------------ */
-/* readerLoop() — background thread                                    */
+/* readerLoop()                                                        */
 /* ------------------------------------------------------------------ */
 
 void Client::readerLoop() {
@@ -205,7 +218,6 @@ void Client::readerLoop() {
         int n = ::recv(sock_, buf, sizeof(buf), 0);
         if (n <= 0) {
             running_ = false;
-            /* Wake up all pending requests with an error. */
             std::lock_guard<std::mutex> lk(mu_);
             for (auto& [rid, pr] : pending_) {
                 pr->error = true;
@@ -218,7 +230,6 @@ void Client::readerLoop() {
         std::lock_guard<std::mutex> lk(mu_);
         recvBuf_.append(buf, static_cast<size_t>(n));
 
-        /* Process all complete messages in the buffer. */
         for (;;) {
             auto eom_pos = recvBuf_.find(EOM);
             if (eom_pos == std::string::npos)
@@ -227,7 +238,6 @@ void Client::readerLoop() {
             std::string frame = recvBuf_.substr(0, eom_pos);
             recvBuf_.erase(0, eom_pos + 1);
 
-            /* Split on DELIM — expect exactly 3 fields. */
             auto d1 = frame.find(DELIM);
             if (d1 == std::string::npos) continue;
             auto d2 = frame.find(DELIM, d1 + 1);
@@ -237,18 +247,6 @@ void Client::readerLoop() {
             std::string source  = frame.substr(d1 + 1, d2 - d1 - 1);
             std::string payload = frame.substr(d2 + 1);
 
-            /* Check subscriptions first. */
-            auto sub_it = subs_.find(rid);
-            if (sub_it != subs_.end()) {
-                auto cb = sub_it->second;  /* copy under lock */
-                /* Release lock before invoking user callback to avoid deadlock. */
-                mu_.unlock();
-                try { cb(rid, source, payload); } catch (...) {}
-                mu_.lock();
-                continue;
-            }
-
-            /* Check pending requests. */
             auto pr_it = pending_.find(rid);
             if (pr_it != pending_.end()) {
                 auto pr = pr_it->second;
@@ -280,7 +278,6 @@ Response Client::sendRequest(const std::string& keyword,
 
     auto pr = std::make_shared<PendingRequest>();
 
-    /* Build the frame: rid \x1E keyword \x1E payload \x04 */
     std::string frame;
     frame.reserve(rid.size() + 1 + keyword.size() + 1 + payload.size() + 1);
     frame += rid;
@@ -303,7 +300,6 @@ Response Client::sendRequest(const std::string& keyword,
         throw;
     }
 
-    /* Wait for the reader thread to fill in our slot. */
     {
         std::unique_lock<std::mutex> lk(mu_);
         bool ok = pr->cv.wait_for(lk, timeout, [&] { return pr->ready; });
@@ -317,80 +313,6 @@ Response Client::sendRequest(const std::string& keyword,
     }
 
     return std::move(pr->response);
-}
-
-/* ------------------------------------------------------------------ */
-/* subscribe()                                                         */
-/* ------------------------------------------------------------------ */
-
-std::string Client::subscribe(const std::string& onquery,
-                               const std::string& query,
-                               SubscriptionCallback callback)
-{
-    if (!running_)
-        throw ConnectionError("Client is not connected.");
-
-    std::string rid = generateRequestId();
-
-    /* Build a small JSON payload matching the Python/Node drivers. */
-    std::string json_payload = "{\"onquery\":\"" + simple_json_escape(onquery) +
-                               "\",\"query\":\"" + simple_json_escape(query) + "\"}";
-
-    std::string frame;
-    frame.reserve(rid.size() + 1 + 9 /*subscribe*/ + 1 + json_payload.size() + 1);
-    frame += rid;
-    frame += DELIM;
-    frame += "subscribe";
-    frame += DELIM;
-    frame += json_payload;
-    frame += EOM;
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        subs_[rid] = std::move(callback);
-    }
-
-    try {
-        sendRaw(frame);
-    } catch (...) {
-        std::lock_guard<std::mutex> lk(mu_);
-        subs_.erase(rid);
-        throw;
-    }
-
-    return rid;
-}
-
-/* ------------------------------------------------------------------ */
-/* unsubscribe()                                                       */
-/* ------------------------------------------------------------------ */
-
-void Client::unsubscribe(const std::string& rid) {
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        subs_.erase(rid);
-    }
-
-    if (!running_)
-        return;
-
-    /* Send unsubscribe frame to server. */
-    std::string json_payload = "{\"rid\":\"" + simple_json_escape(rid) + "\"}";
-
-    std::string frame;
-    frame.reserve(rid.size() + 1 + 11 /*unsubscribe*/ + 1 + json_payload.size() + 1);
-    frame += rid;
-    frame += DELIM;
-    frame += "unsubscribe";
-    frame += DELIM;
-    frame += json_payload;
-    frame += EOM;
-
-    try {
-        sendRaw(frame);
-    } catch (...) {
-        /* Silently ignore — local handler is already removed. */
-    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -416,17 +338,11 @@ void Client::close() {
         pr->cv.notify_all();
     }
     pending_.clear();
-    subs_.clear();
 }
 
 /* ------------------------------------------------------------------ */
 /* ORM-style API                                                       */
 /* ------------------------------------------------------------------ */
-
-Client& Client::setup(const std::string& db) {
-    db_ = db;
-    return *this;
-}
 
 /* Skip whitespace at position p; returns new position. */
 static size_t skip_ws(const std::string& s, size_t p) {
@@ -435,8 +351,7 @@ static size_t skip_ws(const std::string& s, size_t p) {
     return p;
 }
 
-/* Extract a JSON value starting at position p in `s`. Returns the span
- * [out_start, out_end) covering the whole value. */
+/* Extract a JSON value starting at position p in `s`. */
 static bool extract_json_value(const std::string& s, size_t p,
                                 size_t& out_start, size_t& out_end) {
     p = skip_ws(s, p);
@@ -477,7 +392,6 @@ static bool extract_json_value(const std::string& s, size_t p,
     return out_end > out_start;
 }
 
-/* Find a top-level key and return its JSON value substring. */
 static std::string find_value(const std::string& raw, const std::string& key) {
     std::string pat = "\"" + key + "\"";
     size_t p = raw.find(pat);
@@ -504,64 +418,59 @@ std::string Client::processResult(const std::string& raw) {
     return find_value(raw, "data");
 }
 
-std::string Client::insert(const std::string& table,
-                           const std::string& recordsJson) {
+std::string Client::insert(const std::string& path,
+                           const std::string& recordJson) {
+    PathParts p = parsePath(path, false);
     std::string payload;
-    payload.reserve(64 + table.size() + recordsJson.size());
+    payload.reserve(64 + path.size() + recordJson.size());
     payload  = "{\"db\":\"";
-    payload += simple_json_escape(db_);
+    payload += simple_json_escape(p.db);
     payload += "\",\"table\":\"";
-    payload += simple_json_escape(table);
+    payload += simple_json_escape(p.table);
     payload += "\",\"records\":";
-    payload += recordsJson.empty() ? std::string("null") : recordsJson;
+    payload += recordJson.empty() ? std::string("null") : recordJson;
     payload += "}";
 
     Response r = sendRequest("insert", payload);
     return processResult(r.payload);
 }
 
-std::string Client::update(const std::string& table,
-                           const std::string& recordsJson,
-                           const std::string& queryJson,
-                           const std::string& protopass,
-                           const std::string& idsJson) {
+std::string Client::update(const std::string& path,
+                           const std::string& recordJson,
+                           const std::string& protopass) {
+    PathParts p = parsePath(path, true);
     std::string payload;
-    payload.reserve(96 + table.size() + recordsJson.size() + queryJson.size() + idsJson.size());
+    payload.reserve(128 + path.size() + recordJson.size());
     payload  = "{\"db\":\"";
-    payload += simple_json_escape(db_);
+    payload += simple_json_escape(p.db);
     payload += "\",\"table\":\"";
-    payload += simple_json_escape(table);
+    payload += simple_json_escape(p.table);
     payload += "\",\"records\":";
-    payload += recordsJson.empty() ? std::string("null") : recordsJson;
-    payload += ",\"query\":";
-    payload += queryJson.empty() ? std::string("null") : queryJson;
-    payload += ",\"protopass\":\"";
+    payload += recordJson.empty() ? std::string("null") : recordJson;
+    payload += ",\"query\":\"\",\"protopass\":\"";
     payload += simple_json_escape(protopass);
-    payload += "\",\"ids\":";
-    payload += idsJson.empty() ? std::string("[]") : idsJson;
-    payload += "}";
+    payload += "\",\"ids\":[\"";
+    payload += simple_json_escape(p.id);
+    payload += "\"]}";
 
     Response r = sendRequest("update", payload);
     return processResult(r.payload);
 }
 
-std::string Client::remove(const std::string& table,
-                           const std::string& queryJson,
-                           const std::string& protopass,
-                           const std::string& idsJson) {
+std::string Client::remove(const std::string& path,
+                           const std::string& protopass) {
+    PathParts p = parsePath(path, true);
     std::string payload;
-    payload.reserve(96 + table.size() + queryJson.size() + idsJson.size());
+    payload.reserve(128 + path.size());
     payload  = "{\"db\":\"";
-    payload += simple_json_escape(db_);
+    payload += simple_json_escape(p.db);
     payload += "\",\"table\":\"";
-    payload += simple_json_escape(table);
-    payload += "\",\"query\":";
-    payload += queryJson.empty() ? std::string("null") : queryJson;
-    payload += ",\"protopass\":\"";
+    payload += simple_json_escape(p.table);
+    payload += "\",\"query\":\"\",\"protopass\":\"";
     payload += simple_json_escape(protopass);
-    payload += "\",\"ids\":";
-    payload += idsJson.empty() ? std::string("[]") : idsJson;
-    payload += "}";
+    payload += "\",\"ids\":[\"";
+    payload += simple_json_escape(p.id);
+    payload += "\"]}";
 
     Response r = sendRequest("delete", payload);
     return processResult(r.payload);
